@@ -1,0 +1,4 @@
+.DS_Store
+*.zxp
+*.p12
+dist/

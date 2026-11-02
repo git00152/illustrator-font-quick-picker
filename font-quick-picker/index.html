@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header>
+    <div class="bar">
+      <input id="q" type="search" placeholder="検索（和名・英名・PS名）" autocomplete="off" spellcheck="false">
+      <button id="btn-view" class="tool" title="フォント名表示／プレビュー表示を切り替え">Aa</button>
+      <button id="btn-grab" class="tool" title="選択中のテキストを見本文字に取り込む">T</button>
+      <button id="btn-settings" class="tool" title="設定">⚙</button>
+    </div>
+    <nav id="tabs">
+      <button data-m="all" class="on">すべて</button>
+      <button data-m="ja">和文</button>
+      <button data-m="en">欧文</button>
+      <button data-m="comp">合成</button>
+      <button data-m="fav">★</button>
+      <button data-m="recent">最近</button>
+      <button data-m="new" title="インストールした日時が新しい順に最新50ファミリー">新着</button>
+    </nav>
+    <nav id="cls" hidden>
+      <button data-c="" class="on">すべて</button>
+      <button data-c="serif">Serif</button>
+      <button data-c="sans">Sans</button>
+      <button data-c="slab">Slab</button>
+      <button data-c="script">Script</button>
+      <button data-c="mono">Mono</button>
+      <button data-c="display">Display</button>
+      <button data-c="symbol">Symbol</button>
+      <button data-c="none">未分類</button>
+    </nav>
+    <div id="settings" hidden>
+      <div class="field">
+        <label for="pv-text">見本文字</label>
+        <div class="pv-row"><input id="pv-text"><button id="btn-pv-reset" title="見本文字を既定（あア亜 永遠 Ag）に戻す">既定に戻す</button></div>
+      </div>
+      <label>サイズ <input id="pv-size" type="range" min="14" max="64"></label>
+      <label class="check"><input id="click-apply" type="checkbox"> テキスト選択中はクリックで適用</label>
+    </div>
+    <div id="hidden-bar" class="drawer" hidden>
+      <span>非表示にしたフォント（↺ で再表示）</span>
+      <div class="btns"><button id="btn-hidden-close">一覧に戻る</button></div>
+    </div>
+    <!-- opened from the panel flyout menu -->
+    <div id="scan" class="drawer" hidden>
+      <label>追加スキャンフォルダ（1行に1パス）<textarea id="extra-dirs" rows="3"></textarea></label>
+      <div class="btns"><button id="btn-rescan">保存して再スキャン</button><button id="btn-scan-close">閉じる</button></div>
+    </div>
+  </header>
+  <main id="list" tabindex="0"><div id="spacer"></div><div id="rows"></div></main>
+  <footer id="status">起動中…</footer>
+  <div id="tip" hidden></div>
+  <script src="js/main.js"></script>
+</body>
+</html>
