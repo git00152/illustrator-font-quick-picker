@@ -154,9 +154,15 @@
     return s;
   }
   function fileURL(p) { return 'file://' + encodeURI(p.split(path.sep).join('/')); }
+  // While the sample text or size is being edited, wait until the input has settled
+  // (and IME conversion is finished) so half-typed text is not rendered and cached.
+  const AI_SETTLE = 1500;
+  let aiEditUntil = 0, aiComposing = false;
+  function aiEdited() { aiEditUntil = Date.now() + AI_SETTLE; }
   function scheduleAi() {
     clearTimeout(aiT);
-    aiT = setTimeout(runAi, 400);   // wait for scrolling/typing to settle
+    if (aiComposing) return;   // compositionend schedules again
+    aiT = setTimeout(runAi, Math.max(400, aiEditUntil - Date.now()));   // 400: scrolling
   }
   async function runAi() {
     if (aiBusy) return;
@@ -176,20 +182,67 @@
       await fsp.mkdir(PV_DIR, { recursive: true });
       await evalJsx('fqp_render(' + JSON.stringify(aiText()) + ',' + cfg.previewSize + ',' + (72 * aiDpr()) + ',' + aiGray() + ',' + JSON.stringify(batch) + ')');
     } catch (e) { /* treated as failures below */ }
-    batch.forEach(([, p]) => aiState.set(p, require('fs').existsSync(p) ? 'ok' : 'fail'));
+    batch.forEach(([, p]) => {
+      let size = -1;
+      try { size = require('fs').statSync(p).size; } catch (e) {}
+      aiState.set(p, size >= 0 ? 'ok' : 'fail');
+      if (size > 0) aiBytes += size;
+    });
+    if (aiBytes > AI_CAP) pruneAiCache();
     aiBusy = false;
     countStatus();
     render();   // draws the images and queues the next batch if more are visible
   }
-  // drop cached preview images not used for 30 days
+  // Cache limits: images unused for 30 days are dropped, and above AI_CAP the least
+  // recently used go until the total is back under 90% of it (so it does not prune
+  // again on the next batch). aiBytes tracks the total between scans.
+  const AI_CAP = 75 * 1024 * 1024;
+  let aiBytes = 0, aiPruning = false;
   async function pruneAiCache() {
+    if (aiPruning) return;
+    aiPruning = true;
     try {
       const limit = Date.now() - 30 * 864e5;
+      const files = [];
+      let total = 0;
       for (const n of await fsp.readdir(PV_DIR)) {
-        const p = path.join(PV_DIR, n), st = await fsp.stat(p);
-        if (st.atimeMs < limit && st.mtimeMs < limit) await fsp.unlink(p);
+        const p = path.join(PV_DIR, n);
+        try {
+          const st = await fsp.stat(p);
+          const used = Math.max(st.atimeMs, st.mtimeMs);
+          if (used < limit) { await fsp.unlink(p); aiState.delete(p); continue; }
+          files.push({ p, used, size: st.size });
+          total += st.size;
+        } catch (e) { /* removed meanwhile */ }
+      }
+      if (total > AI_CAP) {
+        files.sort((a, b) => a.used - b.used);
+        for (const f of files) {
+          if (total <= AI_CAP * 0.9) break;
+          try { await fsp.unlink(f.p); aiState.delete(f.p); total -= f.size; } catch (e) {}
+        }
+      }
+      aiBytes = total;
+    } catch (e) { /* no cache yet */ }
+    aiPruning = false;
+  }
+  // Menu: delete every cached preview image; the visible ones are rendered again
+  async function clearAiCache() {
+    if (aiBusy || aiPruning) { status('プレビューの作成中です。少し待ってからやり直してください'); return; }
+    clearTimeout(aiT);
+    let n = 0, bytes = 0;
+    try {
+      for (const name of await fsp.readdir(PV_DIR)) {
+        if (!name.endsWith('.png')) continue;
+        const p = path.join(PV_DIR, name);
+        try { bytes += (await fsp.stat(p)).size; await fsp.unlink(p); n++; } catch (e) {}
       }
     } catch (e) { /* no cache yet */ }
+    aiState.clear();
+    aiBytes = 0;
+    aiEditUntil = Date.now() + 2500;   // keep the result readable before re-rendering starts
+    status('プレビュー画像のキャッシュを削除しました（' + n + '件・' + (bytes / 1048576).toFixed(1) + 'MB）');
+    render();
   }
 
   function cssStr(s) { return String(s).replace(/["'\\\n<>&]/g, ''); }
@@ -694,8 +747,10 @@
   $('btn-settings').addEventListener('click', () => { $('settings').hidden = !$('settings').hidden; });
   $('btn-grab').addEventListener('click', grabSelText);
   $('btn-pv-reset').addEventListener('click', resetPreviewText);
-  $('pv-text').addEventListener('input', (e) => setPreviewText(e.target.value));
-  $('pv-size').addEventListener('input', (e) => { cfg.previewSize = +e.target.value; saveCfg(); render(); ensureVisible(); });
+  $('pv-text').addEventListener('input', (e) => { aiEdited(); setPreviewText(e.target.value); });
+  $('pv-text').addEventListener('compositionstart', () => { aiComposing = true; clearTimeout(aiT); });
+  $('pv-text').addEventListener('compositionend', () => { aiComposing = false; aiEdited(); scheduleAi(); });
+  $('pv-size').addEventListener('input', (e) => { aiEdited(); cfg.previewSize = +e.target.value; saveCfg(); render(); ensureVisible(); });
   $('extra-dirs').addEventListener('change', (e) => {
     cfg.extraDirs = e.target.value.split('\n').map((s) => s.trim()).filter(Boolean);
     saveCfg();
@@ -720,6 +775,7 @@
     + '<MenuItem Id="hidden" Label="非表示にしたフォント…"/>'
     + '<MenuItem Id="extra" Label="追加スキャンフォルダ…"/>'
     + '<MenuItem Id="rescan" Label="フォントを再スキャン"/>'
+    + '<MenuItem Id="pvclear" Label="プレビュー画像のキャッシュを削除"/>'
     + '<MenuItem Label="---"/>'
     + '<MenuItem Id="reload" Label="パネルを再読み込み（開発用）"/>'
     + '</Menu>';
@@ -747,6 +803,7 @@
     else if (id === 'hidden') setMode('hidden');
     else if (id === 'extra') { $('scan').hidden = false; $('extra-dirs').focus(); }
     else if (id === 'rescan') rescanAll();
+    else if (id === 'pvclear') clearAiCache();
     else if (id === 'reload') reloadPanel();
   }
   function setupFlyout() {
