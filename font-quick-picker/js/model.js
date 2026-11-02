@@ -75,6 +75,9 @@ function buildFamilies(host, psMap, isLiveType, compNames) {
       index: m ? m.index : 0,
       local: !comp,
       cls: m && m.cls || '',
+      // names the OS may know this face by, for previews without reading the file
+      full: m && m.famEn ? (m.famEn + ' ' + (m.styEn || '')).trim() : '',
+      fams: Array.from(new Set([m && m.famEn, m && m.famJa, hf].filter(Boolean))),
     });
   }
 

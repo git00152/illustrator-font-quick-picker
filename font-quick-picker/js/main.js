@@ -101,23 +101,52 @@
   async function loadFace(st) {
     const a = aliasOf(st);
     let face = null, buf = false;
+    // descriptors match the style, so the browser never synthesizes bold/italic
+    const desc = { weight: String(st.weight || 400), style: st.italic ? 'italic' : 'normal' };
     if (st.local) {
-      try { face = new FontFace(a, 'local("' + st.ps + '")'); await face.load(); } catch (e) { face = null; }
+      // older Chromium (CEP) does not always match the PostScript name, so the full
+      // name is tried as well
+      const src = Array.from(new Set([st.ps, st.full, st.ps.replace(/-/g, ' ')].filter(Boolean)))
+        .map((n) => 'local("' + cssStr(n) + '")').join(', ');
+      try { face = new FontFace(a, src, desc); await face.load(); } catch (e) { face = null; }
     }
     // Adobe Fonts files are never read whole: their previews use only the font as
     // activated in the OS (local()), and the indexer reads just their name tables
     if (!face && st.file && st.index === 0 && !indexer.isLiveType(st.file)) {
       try {
         const d = await fsp.readFile(st.file);
-        face = new FontFace(a, d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength));
+        face = new FontFace(a, d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength), desc);
         await face.load();
         buf = true;
       } catch (e) { face = null; }
     }
-    if (!face) { loaded.set(a, { failed: true, last: Date.now() }); return; }
+    if (!face) {
+      // last resort: the family as installed in the OS (CSS font-family plus weight/style)
+      const sys = (st.fams || []).some(familyAvailable);
+      loaded.set(a, sys ? { ok: true, sys: true, last: Date.now() } : { failed: true, last: Date.now() });
+      return;
+    }
     document.fonts.add(face);
     loaded.set(a, { ok: true, face, buf, last: Date.now() });
     if (buf) { bufCount++; evict(); }
+  }
+  // font names go inside CSS strings inside HTML attributes: drop quotes and backslashes
+  function cssStr(s) { return String(s).replace(/["'\\\n<>&]/g, ''); }
+  // A family is installed if text measures the same with two different fallbacks.
+  const famAvail = new Map();
+  const measureCtx = document.createElement('canvas').getContext('2d');
+  function familyAvailable(name) {
+    if (famAvail.has(name)) return famAvail.get(name);
+    const w = (fb) => { measureCtx.font = '40px "' + cssStr(name) + '", ' + fb; return measureCtx.measureText('Hamburgefonstiv あ永 0123').width; };
+    const ok = Math.abs(w('serif') - w('monospace')) < 0.5;
+    famAvail.set(name, ok);
+    return ok;
+  }
+  // CSS for a preview: the loaded face first, then the OS family with the style's weight
+  function pvFont(a, st) {
+    return 'font-family:\'' + a + '\',' + (st.fams || []).map((n) => '\'' + cssStr(n) + '\'').join(',')
+      + (st.fams && st.fams.length ? ',' : '') + 'system-ui;font-weight:' + (st.weight || 400)
+      + ';font-style:' + (st.italic ? 'italic' : 'normal');
   }
   function evict() {
     if (bufCount <= BUF_MAX) return;
@@ -265,7 +294,7 @@
         + '<span class="style"><span class="st-name">' + esc(st.name) + '</span>'
         + (multi ? '<b data-act="toggle" title="ウエイト一覧">' + f.styles.length + (open ? ' ▾' : ' ▸') + '</b>' : '') + '</span>'
         + hideIcon + '</div>'
-        + (compact() ? '' : '<div class="' + pvClass(a) + '" style="font-family:\'' + a + '\',system-ui;font-size:' + cfg.previewSize + 'px">' + pv + '</div>')
+        + (compact() ? '' : '<div class="' + pvClass(a) + '" style="' + pvFont(a, st) + ';font-size:' + cfg.previewSize + 'px">' + pv + '</div>')
         + '</div>';
       if (!compact()) want.push(st);
       if (open) {
@@ -276,7 +305,7 @@
           if (wy + SH < top - 200 || wy > top + h + 200) return;   // off screen
           html += '<div class="w-row' + (j === f.cur ? ' on' : '') + '" data-i="' + i + '" data-s="' + j + '" style="top:' + (2 + j * SH) + 'px;height:' + SH + 'px">'
             + '<span class="w-name">' + esc(ws.name) + '</span>'
-            + (compact() ? '' : '<span class="' + pvClass(wa) + ' w-pv" style="font-family:\'' + wa + '\',system-ui;font-size:' + subPvSize() + 'px">' + pv + '</span>')
+            + (compact() ? '' : '<span class="' + pvClass(wa) + ' w-pv" style="' + pvFont(wa, ws) + ';font-size:' + subPvSize() + 'px">' + pv + '</span>')
             + '</div>';
           if (!compact()) want.push(ws);
         });

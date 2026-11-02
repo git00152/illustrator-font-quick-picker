@@ -1,6 +1,6 @@
 # Font Quick Picker (Illustrator CEP panel)
 
-バージョン 0.1.0（変更履歴は [CHANGELOG.md](CHANGELOG.md)。パネルメニューの先頭にも表示）
+バージョン 0.1.1（変更履歴は [CHANGELOG.md](CHANGELOG.md)。パネルメニューの先頭にも表示）
 
 Illustrator 用の高速フォントピッカー。和名・英名・PostScript名を横断してインクリメンタル検索し、仮想スクロールで表示中の行だけフォントを読み込みます。
 
