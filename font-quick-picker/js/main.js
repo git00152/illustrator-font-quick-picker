@@ -110,9 +110,8 @@
         .map((n) => 'local("' + cssStr(n) + '")').join(', ');
       try { face = new FontFace(a, src, desc); await face.load(); } catch (e) { face = null; }
     }
-    // Adobe Fonts files are never read whole: their previews use only the font as
-    // activated in the OS (local()), and the indexer reads just their name tables
-    if (!face && st.file && st.index === 0 && !indexer.isLiveType(st.file)) {
+    // only files the indexer found are read; Adobe Fonts files never are (see indexer)
+    if (!face && st.file && st.index === 0 && !indexer.isAdobeFontsPath(st.file)) {
       try {
         const d = await fsp.readFile(st.file);
         face = new FontFace(a, d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength), desc);
@@ -131,6 +130,68 @@
     if (buf) { bufCount++; evict(); }
   }
   // font names go inside CSS strings inside HTML attributes: drop quotes and backslashes
+  // ---------- Illustrator-rendered previews ----------
+  // Fonts the panel cannot draw (Adobe Fonts usable only in Adobe apps, composite
+  // fonts) are set by Illustrator itself and captured as PNG (host.jsx fqp_render).
+  // Images are cached per font and preview text.
+  const crypto = require('crypto');
+  const PV_DIR = path.join(DATA, 'pv');
+  const AI_BATCH = 8;
+  // rendered at the preview size and the screen's pixel density, then shown 1:1
+  // text color of the panel theme (CSS filters blur images in CEP's Chromium)
+  function aiGray() { return document.body.classList.contains('light') ? 30 : 232; }
+  function aiDpr() { return Math.max(1, Math.min(3, Math.round(window.devicePixelRatio || 1))); }
+  const aiState = new Map();   // png path -> 'ok' | 'pending' | 'fail'
+  let aiWant = [], aiT = null, aiBusy = false;
+  function aiText() { return (cfg.previewText || ' ').slice(0, 60); }
+  function aiPath(st) {
+    const key = ['r3', st.ps, aiText(), cfg.previewSize, aiDpr(), aiGray()].join('\n');
+    return path.join(PV_DIR, crypto.createHash('md5').update(key).digest('hex') + '.png');
+  }
+  function aiStatus(p) {
+    let s = aiState.get(p);
+    if (!s && require('fs').existsSync(p)) { s = 'ok'; aiState.set(p, s); }
+    return s;
+  }
+  function fileURL(p) { return 'file://' + encodeURI(p.split(path.sep).join('/')); }
+  function scheduleAi() {
+    clearTimeout(aiT);
+    aiT = setTimeout(runAi, 400);   // wait for scrolling/typing to settle
+  }
+  async function runAi() {
+    if (aiBusy) return;
+    const seen = new Set(), batch = [];
+    for (const st of aiWant) {
+      const p = aiPath(st);
+      if (seen.has(p) || aiStatus(p)) continue;
+      seen.add(p);
+      batch.push([st.ps, p]);
+      if (batch.length >= AI_BATCH) break;
+    }
+    if (!batch.length) return;
+    aiBusy = true;
+    batch.forEach(([, p]) => aiState.set(p, 'pending'));
+    status('Illustrator でプレビューを作成中…（' + batch.length + '件）');
+    try {
+      await fsp.mkdir(PV_DIR, { recursive: true });
+      await evalJsx('fqp_render(' + JSON.stringify(aiText()) + ',' + cfg.previewSize + ',' + (72 * aiDpr()) + ',' + aiGray() + ',' + JSON.stringify(batch) + ')');
+    } catch (e) { /* treated as failures below */ }
+    batch.forEach(([, p]) => aiState.set(p, require('fs').existsSync(p) ? 'ok' : 'fail'));
+    aiBusy = false;
+    countStatus();
+    render();   // draws the images and queues the next batch if more are visible
+  }
+  // drop cached preview images not used for 30 days
+  async function pruneAiCache() {
+    try {
+      const limit = Date.now() - 30 * 864e5;
+      for (const n of await fsp.readdir(PV_DIR)) {
+        const p = path.join(PV_DIR, n), st = await fsp.stat(p);
+        if (st.atimeMs < limit && st.mtimeMs < limit) await fsp.unlink(p);
+      }
+    } catch (e) { /* no cache yet */ }
+  }
+
   function cssStr(s) { return String(s).replace(/["'\\\n<>&]/g, ''); }
   // A family is installed if text measures the same with two different fallbacks.
   const famAvail = new Map();
@@ -193,6 +254,9 @@
     if (multiVendor(f)) {
       h += '<div class="tip-warn">⚠ 同名のフォントが複数の提供元（' + f.vendors.map((x) => model.VENDORS[x].label).join('・')
         + '）から入っています。Illustrator が実際にどちらを使っているかは判別できないため、条件の厳しい方に合わせてください</div>';
+    }
+    if (f.vendorGuess && v === 'adobe') {
+      h += '<div class="tip-warn">フォントファイルが見つからないため Adobe Fonts と推定しています（Adobe Fonts のファイルは規約に従い参照しません）。Creative Cloud アプリのフォント一覧で確認してください</div>';
     }
     if (r) {
       h += '<div class="tip-sum">' + esc(r.summary) + '</div><ul class="tip-list">'
@@ -266,6 +330,25 @@
     $list.scrollTop = geom().top(i) - before;
   }
   function setOpen(key) { state.open = key; }
+  // Live text in the font when the panel can draw it; otherwise Illustrator's rendering
+  // (see the "Illustrator-rendered previews" section) or a placeholder until it exists.
+  function previewHTML(tag, extra, a, st, size, pv) {
+    const L = loaded.get(a);
+    if (L && L.failed) {
+      const p = aiPath(st), s = aiStatus(p);
+      if (s === 'ok') {
+        // srcset's density descriptor keeps the image at its natural size (no
+        // resampling); the smaller weight rows scale it with zoom
+        const zoom = size === cfg.previewSize ? '' : ' style="zoom:' + (size / cfg.previewSize).toFixed(3) + '"';
+        return '<' + tag + ' class="pv' + extra + '"><img class="pv-img" srcset="' + esc(fileURL(p)) + ' ' + aiDpr() + 'x"'
+          + zoom + ' alt=""></' + tag + '>';
+      }
+      if (s !== 'fail') aiWant.push(st);
+      return '<' + tag + ' class="pv ' + (s === 'fail' ? 'failed' : 'pending') + extra + '" style="font-size:' + size + 'px">'
+        + (s === 'fail' ? 'プレビューを作成できません' : pv) + '</' + tag + '>';
+    }
+    return '<' + tag + ' class="' + pvClass(a) + extra + '" style="' + pvFont(a, st) + ';font-size:' + size + 'px">' + pv + '</' + tag + '>';
+  }
   function pvClass(a) {
     const L = loaded.get(a);
     return L && L.ok ? 'pv' : (L && L.failed ? 'pv failed' : 'pv pending');
@@ -280,6 +363,7 @@
     const hideIcon = state.mode === 'hidden' ? '<span class="hide" data-act="hide" title="再表示">↺</span>'
       : '<span class="hide" data-act="hide" title="このフォントを非表示">⊘</span>';
     const want = [];
+    aiWant = [];
     let html = '';
     for (let i = s; i < e; i++) {
       const f = state.filtered[i], st = f.styles[f.cur], a = aliasOf(st), y = g.top(i);
@@ -294,7 +378,7 @@
         + '<span class="style"><span class="st-name">' + esc(st.name) + '</span>'
         + (multi ? '<b data-act="toggle" title="ウエイト一覧">' + f.styles.length + (open ? ' ▾' : ' ▸') + '</b>' : '') + '</span>'
         + hideIcon + '</div>'
-        + (compact() ? '' : '<div class="' + pvClass(a) + '" style="' + pvFont(a, st) + ';font-size:' + cfg.previewSize + 'px">' + pv + '</div>')
+        + (compact() ? '' : previewHTML('div', '', a, st, cfg.previewSize, pv))
         + '</div>';
       if (!compact()) want.push(st);
       if (open) {
@@ -305,7 +389,7 @@
           if (wy + SH < top - 200 || wy > top + h + 200) return;   // off screen
           html += '<div class="w-row' + (j === f.cur ? ' on' : '') + '" data-i="' + i + '" data-s="' + j + '" style="top:' + (2 + j * SH) + 'px;height:' + SH + 'px">'
             + '<span class="w-name">' + esc(ws.name) + '</span>'
-            + (compact() ? '' : '<span class="' + pvClass(wa) + ' w-pv" style="' + pvFont(wa, ws) + ';font-size:' + subPvSize() + 'px">' + pv + '</span>')
+            + (compact() ? '' : previewHTML('span', ' w-pv', wa, ws, subPvSize(), pv))
             + '</div>';
           if (!compact()) want.push(ws);
         });
@@ -314,6 +398,7 @@
     }
     $rows.innerHTML = html;
     if (want.length) scheduleLoads(want);
+    scheduleAi();
   }
 
   // ---------- filtering ----------
@@ -348,7 +433,7 @@
   }
   function rebuild() {
     const cur = state.filtered[state.sel];
-    state.families = model.buildFamilies(state.host, state.psMap, indexer.isLiveType, state.comp);
+    state.families = model.buildFamilies(state.host, state.psMap, state.comp);
     applyFilter(cur && cur.key);
   }
 
@@ -482,6 +567,7 @@
   }
 
   // ---------- data refresh ----------
+  const HOST_LIST_VERSION = 2;   // 2: adds qdName
   async function refreshHost(force) {
     const count = parseInt(await evalJsx('fqp_count()'), 10);
     if (!force && count === state.hostCount) return;
@@ -491,7 +577,7 @@
     try { list = JSON.parse(r); } catch (e) { status('フォント一覧の取得に失敗しました: ' + String(r).slice(0, 80)); return; }
     state.host = list;
     state.hostCount = count;
-    saveJSON('hostfonts.json', { count, list });
+    saveJSON('hostfonts.json', { count, list, v: HOST_LIST_VERSION });
     rebuild();
   }
   async function rescanFiles() {
@@ -694,6 +780,7 @@
     applySkin();
     registerKeys();
     setupFlyout();
+    pruneAiCache();
     Object.assign(cfg, await loadJSON('settings.json', {}));
     favSet = new Set(cfg.favorites || []);
     hiddenSet = new Set(cfg.hidden || []);
@@ -712,7 +799,9 @@
     ]);
     state.psMap = indexer.toPsMap(files);
     state.comp = comp;
-    if (hc && hc.list) { state.host = hc.list; state.hostCount = hc.count; rebuild(); }
+    // a cache from an older format is shown at once but refreshed below
+    const stale = !hc || hc.v !== HOST_LIST_VERSION;
+    if (hc && hc.list) { state.host = hc.list; state.hostCount = stale ? -1 : hc.count; rebuild(); }
     // 2) refresh Illustrator's font list only if the count changed
     await refreshHost(false);
     // 3) incremental file scan in the background

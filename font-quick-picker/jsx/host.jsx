@@ -8,7 +8,8 @@ function fqp_count() {
     return String(app.textFonts.length);
 }
 
-// Returns JSON: [["PostScriptName","Family","Style"], ...]
+// Returns JSON: [["PostScriptName","Family","Style","QuickDrawName"], ...]
+// qdName is the localized menu name on some systems (e.g. Japanese names)
 function fqp_list() {
     var tf = app.textFonts;
     var n = tf.length;
@@ -16,7 +17,9 @@ function fqp_list() {
     for (var i = 0; i < n; i++) {
         try {
             var f = tf[i];
-            a.push('["' + fqp_esc(f.name) + '","' + fqp_esc(f.family) + '","' + fqp_esc(f.style) + '"]');
+            var qd = "";
+            try { qd = f.qdName; } catch (e2) {}
+            a.push('["' + fqp_esc(f.name) + '","' + fqp_esc(f.family) + '","' + fqp_esc(f.style) + '","' + fqp_esc(qd) + '"]');
         } catch (e) {
             // skip fonts Illustrator cannot describe
         }
@@ -116,6 +119,51 @@ function fqp_selText() {
     } catch (e) {
         return "";
     }
+}
+
+// Renders previews for fonts the panel cannot draw itself (Adobe Fonts available only
+// to Adobe apps, composite fonts): Illustrator sets `text` in each font in a temporary
+// document and captures it as a transparent PNG. items: [[postScriptName, pngPath], ...]
+// The temporary document is closed unsaved and the previous document is re-activated.
+// res: capture resolution in ppi (72 x the panel's device pixel ratio), so the PNG is
+// shown 1:1 without resampling. Returns "OK:<rendered count>".
+// gray: text color 0-255, matching the panel theme (no recoloring in the panel).
+function fqp_render(text, size, res, gray, items) {
+    var prev = app.documents.length ? app.activeDocument : null;
+    var oldLevel = app.userInteractionLevel;
+    var doc = null, done = 0;
+    app.userInteractionLevel = UserInteractionLevel.DONTDISPLAYALERTS;
+    try {
+        doc = app.documents.add(DocumentColorSpace.RGB, 2000, 400);
+        var ink = new RGBColor();
+        ink.red = gray; ink.green = gray; ink.blue = gray;
+        var opts = new ImageCaptureOptions();
+        opts.antiAliasing = true;
+        opts.transparency = true;
+        opts.resolution = res;
+        for (var i = 0; i < items.length; i++) {
+            var tf = null;
+            try {
+                tf = doc.textFrames.add();
+                tf.contents = text;
+                var ca = tf.textRange.characterAttributes;
+                ca.textFont = app.textFonts.getByName(items[i][0]);
+                ca.size = size;
+                ca.fillColor = ink;
+                var b = tf.visibleBounds;   // [left, top, right, bottom]
+                doc.imageCapture(new File(items[i][1]), [b[0] - 2, b[1] + 2, b[2] + 2, b[3] - 2], opts);
+                done++;
+            } catch (e) {
+                // font missing or capture failed: the panel shows it as unavailable
+            }
+            if (tf) { try { tf.remove(); } catch (e2) {} }
+        }
+    } catch (e) {
+    }
+    if (doc) { try { doc.close(SaveOptions.DONOTSAVECHANGES); } catch (e) {} }
+    if (prev) { try { prev.activate(); } catch (e) {} }
+    app.userInteractionLevel = oldLevel;
+    return "OK:" + done;
 }
 
 // PostScript name of the first selected text, or ""

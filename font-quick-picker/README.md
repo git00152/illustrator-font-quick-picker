@@ -1,6 +1,6 @@
 # Font Quick Picker (Illustrator CEP panel)
 
-バージョン 0.1.1（変更履歴は [CHANGELOG.md](CHANGELOG.md)。パネルメニューの先頭にも表示）
+バージョン 0.1.2（変更履歴は [CHANGELOG.md](CHANGELOG.md)。パネルメニューの先頭にも表示）
 
 Illustrator 用の高速フォントピッカー。和名・英名・PostScript名を横断してインクリメンタル検索し、仮想スクロールで表示中の行だけフォントを読み込みます。
 
@@ -56,7 +56,7 @@ Illustrator 用の高速フォントピッカー。和名・英名・PostScript�
 
 | バッジ | 判定根拠 |
 |---|---|
-| Adobe | Adobe Fonts の `livetype` フォルダ、またはライセンスURLが typekit.com / fonts.adobe.com |
+| Adobe | Illustrator の一覧にあるのにフォントファイルが見つからない書体（推定。Adobe Fonts のフォルダは読まない）、またはライセンスURLが typekit.com / fonts.adobe.com |
 | モリサワ | ライセンス欄（name ID 13）が `MPCD:`、または `MorisawaFonts` フォルダ |
 | Google | SIL OFL / Apache で、著作権表記が Google Fonts の形式、または FontBase のフォルダ |
 | OFL | SIL OFL / Apache（Google 以外） |
@@ -76,7 +76,7 @@ Illustrator 用の高速フォントピッカー。和名・英名・PostScript�
 - `jsx/host.jsx`：`app.textFonts` を一括取得（件数が変わったときだけ再取得）、選択テキストへ適用
 - `js/indexer.js`：フォントファイルの `name` / `OS/2` テーブルだけを読み、PostScript名→和名・英名・ウエイトを対応付け。サイズ＋更新日時で差分更新
 - `js/model.js`：ファミリー化と検索（DOM非依存）
-- `js/main.js`：仮想リスト、遅延読み込み（`local()` 優先。`local()` で読めないフォントはファイルから読み込み、上限40件でLRU破棄。Adobe Fonts のファイルは丸ごと読まず `local()` のみ）
+- `js/main.js`：仮想リスト、遅延読み込み（`local()` 優先。読めないフォントは索引にあるファイルから読み込み、上限40件でLRU破棄。それでも描けない Adobe Fonts・合成フォントは Illustrator に描かせた画像を表示し、`pv/` にキャッシュ）
 
 キャッシュ・設定：`~/Library/Application Support/FontQuickPicker/`
 
@@ -84,6 +84,6 @@ Illustrator 用の高速フォントピッカー。和名・英名・PostScript�
 
 1. パネルが開き、ステータスバーにファミリー数が出るか（出ない→PlayerDebugModeとリンク先を確認）
 2. 日本語名で検索できるか（例：「ヒラギノ」）
-3. Adobe Fonts の書体がプレビュー表示されるか（OS に登録されたフォントとしてのみ表示するため、表示されない場合は薄い表示のままになる）
+3. Adobe Fonts の書体がプレビュー表示されるか（Illustrator が一時的な書類で描いた画像。作成中は一瞬ウィンドウが切り替わる）
 4. モリサワ等の書体が和名で引けるか（引けない→設定の「追加スキャンフォルダ」に格納先を追加）
 5. テキスト選択／文字単位選択／グループ内テキストへの適用

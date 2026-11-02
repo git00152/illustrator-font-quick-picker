@@ -29,7 +29,7 @@ function isComposite(ps, family, m, compNames) {
 
 // host: [[ps, family, style], ...] from Illustrator; psMap: from indexer.toPsMap
 // compNames: Set of composite font names (indexer.compositeFontNames)
-function buildFamilies(host, psMap, isLiveType, compNames) {
+function buildFamilies(host, psMap, compNames) {
   const fams = new Map();
   // vendors by family name, for styles without a file of their own (named instances
   // of a variable font have PostScript names that no file declares)
@@ -44,7 +44,7 @@ function buildFamilies(host, psMap, isLiveType, compNames) {
     }
   }
   for (const row of host) {
-    const ps = row[0], hf = row[1], hs = row[2];
+    const ps = row[0], hf = row[1], hs = row[2], qd = row[3] || '';
     const m = psMap[ps];
     const comp = isComposite(ps, hf, m, compNames);
     const key = m ? (m.famEn || m.famJa || hf) : (comp ? 'comp:' + hf : hf);
@@ -60,6 +60,12 @@ function buildFamilies(host, psMap, isLiveType, compNames) {
     }
     if (!f.nameEn) f.nameEn = hf;
     if (comp && !f.nameJa && /[^\x00-\x7f]/.test(hf)) f.nameJa = hf;
+    // fonts without a file (Adobe Fonts): Japanese name from Illustrator, or a
+    // Japanese-font naming pattern, marks the family as Japanese
+    if (!m && !comp) {
+      if (!f.nameJa && JA_CHARS.test(qd)) f.nameJa = qd.replace(new RegExp('\\s*' + escRe(hs) + '$'), '').trim() || qd;
+      if (JA_NAME.test(hf) || JA_NAME.test(ps) || JA_CHARS.test(qd + hf + ps)) f.jis = true;
+    }
     const vs = m ? m.vendors : Array.from(famVendors.get(hf) || []);
     for (const v of vs) if (f.vendors.indexOf(v) < 0) f.vendors.push(v);
     if (m && !f.mfr) { f.mfr = m.mfr; f.licUrl = m.licUrl; }
@@ -83,6 +89,9 @@ function buildFamilies(host, psMap, isLiveType, compNames) {
 
   const out = [];
   for (const f of fams.values()) {
+    // Adobe Fonts files are never read, so a font Illustrator lists without any font
+    // file of its own is presumed to come from Adobe Fonts
+    if (!f.vendors.length && !f.comp) { f.vendors.push('adobe'); f.vendorGuess = true; }
     if (f.nameJa) f.jis = true;
     f.styles.sort((a, b) => (a.width - b.width) || (a.italic - b.italic) || (a.weight - b.weight));
     let def = 0, best = 1e9;
@@ -130,6 +139,17 @@ function search(families, query, favSet) {
   hits.sort((a, b) => (b.score - a.score) || (a.i - b.i));
   return hits.map((h) => h.f);
 }
+
+const JA_CHARS = /[ぁ-んァ-ヶ一-龠]/;
+// Japanese fonts without a readable file: vendor prefixes and naming conventions
+// (heuristic; "Gothic" alone is left out because Latin fonts use it too)
+const JA_NAME = new RegExp([
+  /^(A-OTF|A P-OTF|FOT-|AB-|TA-|VDL|DF|HG|TB|DNP|Koz|Ryo|Iwata|Jiyu|Morisawa|Hiragino|Toppan)/.source,
+  /^(Ryumin|Rodin|Seurat|Matisse|Tsukushi|BIZ ?UD|UD |Gen |Source Han|Noto (Sans|Serif) (CJK|JP)|Zen |Shippori)/.source,
+  /^(M ?PLUS|Kosugi|Sawarabi|Yu |Klee|Kaisei|Dela Gothic|Mochiy|Yusei|Hina Mincho|Otomanopee|Kiwi|Yomogi|Murecho|Yuji|Dot ?Gothic|Reggae One|RocknRoll|Stick|Train One|Potta|New Tegomin|Rampart)/.source,
+  /(Pr6N?|Pr5N?|ProN|StdN)\b|Mincho|-W\d\b|\bJP\b|Japanese/.source,
+].join('|'), 'i');
+function escRe(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 // Category filters for the tabs. 'ja' / 'en' / 'comp' are mutually exclusive.
 function category(f) {

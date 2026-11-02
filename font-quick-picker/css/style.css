@@ -149,3 +149,7 @@ footer {
 .lv-ask i { color: #9a9a9a; }
 .tip-meta, .tip-src { margin-top: 8px; padding-top: 6px; border-top: 1px solid rgba(255, 255, 255, .1); color: #9a9a9a; font-size: 10px; word-break: break-all; }
 #tip a { color: #7fb2ff; cursor: pointer; text-decoration: underline; }
+
+/* previews rendered by Illustrator in the theme's text color, shown 1:1 (no filters) */
+.pv-img { display: block; max-width: none; pointer-events: none; }
+.w-pv .pv-img { display: inline-block; vertical-align: middle; }

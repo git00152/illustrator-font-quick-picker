@@ -6,7 +6,7 @@ const fsp = fs.promises;
 const path = require('path');
 const os = require('os');
 
-const INDEX_VERSION = 3;   // 2: Latin classification (cls), 3: vendor/licence fields
+const INDEX_VERSION = 4;   // 2: Latin classification (cls), 3: vendor/licence fields, 4: no Adobe Fonts files
 const FONT_EXT = new Set(['.otf', '.ttf', '.ttc', '.otc']);
 // 0 copyright, 1/2/16/17 family/style, 4 full name, 6 PostScript, 8 manufacturer, 13/14 licence text/URL
 const WANT_IDS = new Set([0, 1, 2, 4, 6, 8, 13, 14, 16, 17]);
@@ -37,7 +37,6 @@ function defaultScanDirs() {
     return illustratorFontDirs().concat([
       path.join(win, 'Fonts'),
       path.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'Windows', 'Fonts'),
-      path.join(process.env.APPDATA || '', 'Adobe', 'CoreSync', 'plugins', 'livetype'),
     ]);
   }
   return illustratorFontDirs().concat([
@@ -46,7 +45,6 @@ function defaultScanDirs() {
     path.join(h, 'Library', 'Fonts'),
     '/System/Library/AssetsV2',
     '/Library/Application Support/Adobe/Fonts',
-    path.join(h, 'Library', 'Application Support', 'Adobe', 'CoreSync', 'plugins', 'livetype'),
   ]);
 }
 
@@ -84,11 +82,15 @@ const NAME_HINTS = [
   [/serif|roman|antiqua|garamond|times|palatino|georgia|caslon|bodoni|didot|baskerville|cochin|hoefler|athelas|minion|stix|charter|century|myungjo|songti|stsong|mincho|book/, 'serif'],
 ];
 
-function isLiveType(file) {
-  return !!file && file.indexOf(path.sep + 'livetype' + path.sep) >= 0;
+// Adobe Fonts (Creative Cloud) keeps its fonts here. Its terms forbid accessing them
+// other than through Adobe's own means, so these folders are never read, not even
+// when listed as an extra scan folder.
+function isAdobeFontsPath(p) {
+  return /[\\/](CoreSync|livetype)([\\/]|$)/i.test(p);
 }
 
 async function walk(dir, out, depth, topFilter) {
+  if (isAdobeFontsPath(dir)) return;
   let ents;
   try { ents = await fsp.readdir(dir, { withFileTypes: true }); } catch (e) { return; }
   for (const e of ents) {
@@ -97,7 +99,7 @@ async function walk(dir, out, depth, topFilter) {
       if (depth < 8 && (!topFilter || topFilter(e.name))) await walk(p, out, depth + 1, null);
     } else if (e.isFile()) {
       const ext = path.extname(e.name).toLowerCase();
-      if (FONT_EXT.has(ext) || (ext === '' && isLiveType(p))) out.push(p);
+      if (FONT_EXT.has(ext)) out.push(p);
     }
   }
 }
@@ -345,7 +347,7 @@ function licenceInfo(names) {
 // adobe | morisawa | google | ofl | mac | adobeapp | other
 function vendorOf(file, f) {
   const p = file.split(path.sep).join('/');
-  if (isLiveType(file) || f.lic === 'typekit') return 'adobe';
+  if (f.lic === 'typekit') return 'adobe';
   if (f.lic === 'mpcd' || /\/MorisawaFonts\//.test(p)) return 'morisawa';
   if (/^\/System\/Library\//.test(p)) return 'mac';
   if (/\/Adobe\/Fonts\/|\/Required\/Fonts\//.test(p)) return 'adobeapp';   // installed with Adobe apps
@@ -373,5 +375,5 @@ function toPsMap(files) {
 }
 
 module.exports = {
-  dataDir, defaultScanDirs, buildIndex, loadCachedIndex, toPsMap, parseFile, isLiveType, classify, compositeFontNames, vendorOf,
+  dataDir, defaultScanDirs, buildIndex, loadCachedIndex, toPsMap, parseFile, isAdobeFontsPath, classify, compositeFontNames, vendorOf,
 };
