@@ -5,6 +5,7 @@ const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 const os = require('os');
+const store = require('./store.js');
 
 const INDEX_VERSION = 4;   // 2: Latin classification (cls), 3: vendor/licence fields, 4: no Adobe Fonts files
 const FONT_EXT = new Set(['.otf', '.ttf', '.ttc', '.otc']);
@@ -262,10 +263,8 @@ async function pool(items, limit, fn) {
 function cacheFile() { return path.join(dataDir(), 'index.json'); }
 
 async function loadCachedIndex() {
-  try {
-    const j = JSON.parse(await fsp.readFile(cacheFile(), 'utf8'));
-    return j.version === INDEX_VERSION ? (j.files || {}) : {};
-  } catch (e) { return {}; }
+  const j = await store.readJSON(cacheFile(), null);
+  return j && j.version === INDEX_VERSION ? (j.files || {}) : {};
 }
 
 // Incremental: files with unchanged size+mtime reuse cached faces.
@@ -299,7 +298,7 @@ async function buildIndex(opts) {
     done++;
     if (opts.onProgress && done % 100 === 0) opts.onProgress(done, uniq.length);
   });
-  await fsp.writeFile(cacheFile(), JSON.stringify({ version: INDEX_VERSION, files: next }));
+  await store.writeJSONAtomic(cacheFile(), { version: INDEX_VERSION, files: next });
   return { files: next, total: uniq.length, parsed };
 }
 

@@ -8,13 +8,30 @@ function fqp_count() {
     return String(app.textFonts.length);
 }
 
-// Returns JSON: [["PostScriptName","Family","Style","QuickDrawName"], ...]
-// qdName is the localized menu name on some systems (e.g. Japanese names)
-function fqp_list() {
+// Cheap change check: the count plus the PostScript names of the first and last few
+// fonts, so a font swapped for another (same count) is noticed too. "<count>|<names>"
+function fqp_sig() {
     var tf = app.textFonts;
     var n = tf.length;
     var a = [];
     for (var i = 0; i < n; i++) {
+        if (i === 3 && n > 6) i = n - 3;
+        try { a.push(tf[i].name); } catch (e) { a.push("?"); }
+    }
+    return n + "|" + a.join(",");
+}
+
+// Returns JSON: [["PostScriptName","Family","Style","QuickDrawName"], ...] for fonts
+// start .. start+count-1 (all when omitted). The panel fetches the list in chunks so
+// Illustrator is not blocked for the whole list at once.
+// qdName is the localized menu name on some systems (e.g. Japanese names)
+function fqp_list(start, count) {
+    var tf = app.textFonts;
+    var n = tf.length;
+    var from = start || 0;
+    var to = count ? Math.min(n, from + count) : n;
+    var a = [];
+    for (var i = from; i < to; i++) {
         try {
             var f = tf[i];
             var qd = "";
@@ -173,7 +190,12 @@ function fqp_current() {
         var s = app.activeDocument.selection;
         var tr = null;
         if (s && s.typename === "TextRange") tr = s;
-        else if (s && s.length > 0 && s[0].typename === "TextFrame") tr = s[0].textRange;
+        else if (s && s.length > 0) {
+            for (var i = 0; i < s.length && !tr; i++) {
+                var f = fqp_firstFrame(s[i]);
+                if (f) tr = f.textRange;
+            }
+        }
         if (!tr) return "";
         return tr.characterAttributes.textFont.name;
     } catch (e) {

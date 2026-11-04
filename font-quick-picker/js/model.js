@@ -29,7 +29,10 @@ function isComposite(ps, family, m, compNames) {
 
 // host: [[ps, family, style], ...] from Illustrator; psMap: from indexer.toPsMap
 // compNames: Set of composite font names (indexer.compositeFontNames)
-function buildFamilies(host, psMap, compNames) {
+// seen: { ps: ms } when the panel first saw each font in Illustrator's list (0: already
+// there when tracking began). It dates fonts without a file too (Adobe Fonts); fonts
+// seen from the start fall back to the file's install time (ctime).
+function buildFamilies(host, psMap, compNames, seen) {
   const fams = new Map();
   // vendors by family name, for styles without a file of their own (named instances
   // of a variable font have PostScript names that no file declares)
@@ -74,7 +77,7 @@ function buildFamilies(host, psMap, compNames) {
       name: m ? (m.styJa || m.styEn || hs) : hs,
       nameEn: m ? (m.styEn || hs) : hs,
       weight: m ? m.weight : guessWeight(hs),
-      added: m ? m.added || 0 : 0,
+      added: addedAt(ps, m, seen),
       width: m ? m.width : 5,
       italic: m ? m.italic : /italic|oblique/i.test(hs),
       file: m ? m.file : null,
@@ -117,6 +120,40 @@ function buildFamilies(host, psMap, compNames) {
   const coll = new Intl.Collator('ja');
   out.sort((a, b) => coll.compare(a.nameEn, b.nameEn));
   return out;
+}
+
+function addedAt(ps, m, seen) {
+  const t = seen && seen[ps];
+  if (t > 0) return t;
+  return m ? m.added || 0 : 0;
+}
+
+// Updates seen (see buildFamilies) from Illustrator's list; returns true if it changed.
+// The first call (empty seen) records every font as 0, "there from the start".
+function markSeen(seen, host, now) {
+  const first = !Object.keys(seen).length;
+  let changed = false;
+  for (const row of host) {
+    if (!(row[0] in seen)) { seen[row[0]] = first ? 0 : now; changed = true; }
+  }
+  return changed;
+}
+
+// Favorites, hidden and recent fonts are stored by family key, which can change when
+// the font index is missing or rebuilt (the key comes from the font file when there is
+// one). keyPs remembers one PostScript name per stored key; keys no longer present are
+// moved to the family that now holds that PostScript name. Returns the key mapping.
+function remapKeys(families, keyPs, keys) {
+  const have = new Set(families.map((f) => f.key));
+  const psKey = new Map();
+  for (const f of families) for (const s of f.styles) psKey.set(s.ps, f.key);
+  const map = new Map();
+  for (const k of keys) {
+    if (have.has(k)) continue;
+    const to = keyPs[k] && psKey.get(keyPs[k]);
+    if (to && to !== k) map.set(k, to);
+  }
+  return map;
 }
 
 // Multi-token AND match; prefix matches on display/English name rank first.
@@ -187,4 +224,4 @@ const VENDORS = {
 };
 const VENDOR_ORDER = Object.keys(VENDORS);
 
-module.exports = { norm, guessWeight, buildFamilies, search, category, isComposite, listGeometry, VENDORS };
+module.exports = { norm, guessWeight, buildFamilies, markSeen, remapKeys, search, category, isComposite, listGeometry, VENDORS };

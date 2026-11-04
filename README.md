@@ -39,7 +39,7 @@ Adobe Illustrator 用のフォントピッカーパネル（CEP 拡張）です�
 
 ### アンインストール
 
-Illustrator を終了し、`com.git00152.fontquickpicker` フォルダを削除します。フォルダは次のどちらかにあります。
+Illustrator を終了し、`Font Quick Picker` フォルダ（インストール方法によっては `com.git00152.fontquickpicker`）を削除します。フォルダは次のどちらかにあります。
 
 - `~/Library/Application Support/Adobe/CEP/extensions/`
 - `/Library/Application Support/Adobe/CEP/extensions/`
@@ -49,7 +49,7 @@ Illustrator を終了し、`com.git00152.fontquickpicker` フォルダを削除�
 ## プライバシーと動作
 
 - フォントの一覧作成のため、フォントフォルダにあるフォントファイルのうち名前とメタデータのテーブルだけを読み取ります（フォントファイルは変更・複製しません）。
-- Adobe Fonts のフォントファイルは読みません（Adobe Fonts の規約に従い、Adobe が提供する手段以外でアクセスしないため）。パネルで直接描けない書体のプレビューは、Illustrator 自身に一時的な書類で見本文字を描かせ、その画像を表示します。作成中は一瞬ウィンドウが切り替わることがあり、一時的な書類は保存せずに閉じます。
+- Adobe Fonts のフォントファイルは読みません（Adobe Fonts の規約に従い、Adobe が提供する手段以外でアクセスしないため）。パネルで直接描けない書体のプレビューは、Illustrator 自身に一時的な書類で見本文字を描かせ、その画像を表示します。この描画はパネルを操作している間（パネルにフォーカスかマウスポインタがあるとき）だけ行います。作成中は一瞬ウィンドウが切り替わることがあり、一時的な書類は保存せずに閉じます。
 - 設定・お気に入り・キャッシュ（プレビュー画像を含む）はこの Mac の `~/Library/Application Support/FontQuickPicker/` に保存し、外部へ送信しません。
 - ネットワーク通信は行いません。ツールチップの出典リンクをクリックしたときだけ、既定のブラウザでそのページを開きます。
 

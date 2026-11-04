@@ -1,12 +1,14 @@
 # Font Quick Picker (Illustrator CEP panel)
 
-バージョン 0.1.3（変更履歴は [CHANGELOG.md](CHANGELOG.md)。パネルメニューの先頭にも表示）
+バージョン 0.2.0（変更履歴は [CHANGELOG.md](CHANGELOG.md)。パネルメニューの先頭にも表示）
 
 Illustrator 用の高速フォントピッカー。和名・英名・PostScript名を横断してインクリメンタル検索し、仮想スクロールで表示中の行だけフォントを読み込みます。
 
 ## インストール
 
 通常は GitHub Releases の署名済み ZXP からインストールします（リポジトリ直下の README を参照）。
+
+動作確認は macOS 版 Illustrator（2021 / 25.0 以降）で行っています。Windows でも動く作りにはしていますが、未検証です（提供元バッジの「OS 同梱」判定は macOS のみ）。
 
 ### ソースから動かす（開発用・macOS）
 
@@ -33,14 +35,16 @@ Illustrator 用の高速フォントピッカー。和名・英名・PostScript�
 | Alt+→ / Alt+← （リスト内では → ←） | ウエイト一覧を開く／閉じる |
 | Enter / ダブルクリック | 選択中のテキストに適用 |
 | Esc | 検索クリア |
-| f（リスト内） | お気に入り切替 |
+| Alt+F（リスト内では f も） | お気に入り切替 |
+| Alt+H（リスト内では h も） | フォントを非表示 |
+| ⌘1〜⌘7（Windows は Ctrl） | タブ切替（すべて／和文／欧文／合成／★／最近／新着） |
 
 | クリック | 選択し、複数ウエイトの書体はウエイト一覧を展開（開いている書体名をもう一度クリックすると閉じる。閉じるときは適用しない）。テキスト選択中ならそのまま適用（⚙でオフにするとダブルクリック適用） |
 | ウエイト一覧の行をクリック | そのウエイトを選択（・適用） |
 | 行右の「n ▸」 | ウエイト一覧の開閉だけ（適用しない） |
-| h（リスト内）／行の ⊘ | フォントを非表示 |
+| 行の ⊘ | フォントを非表示 |
 
-タブ：すべて／和文（JISコードページ or 日本語名あり）／欧文／合成／★／最近使用／新着（インストール日時＝ctime が新しい順に最新50ファミリー。ウエイト数は数えない）。
+タブ：すべて／和文（JISコードページ or 日本語名あり）／欧文／合成／★／最近使用／新着（パネルが Illustrator のフォント一覧で初めて見た日時が新しい順に最新50ファミリー。Adobe Fonts も対象。この版より前から入っていたフォントはファイルの ctime で代用。ウエイト数は数えない）。
 欧文タブでは Serif・Sans・Slab・Script・Mono・Display・Symbol・未分類 で絞り込める（OS/2 の sFamilyClass → PANOSE → 名前の順に判定）。
 
 - **Aa / あ** ボタン：プレビュー表示／フォント名だけのコンパクト表示を切り替え
@@ -73,10 +77,17 @@ Illustrator 用の高速フォントピッカー。和名・英名・PostScript�
 
 ## 仕組み
 
-- `jsx/host.jsx`：`app.textFonts` を一括取得（件数が変わったときだけ再取得）、選択テキストへ適用
+- `jsx/host.jsx`：`app.textFonts` を 500 件ずつ取得（件数と先頭・末尾の名前が変わったときだけ再取得）、選択テキストへ適用
+- `js/cep.js`：CEP と Illustrator（evalScript）への呼び出しをここに集約。リンクは http/https だけ開く
+- `js/store.js`：設定ファイルの読み書き（一時ファイル→rename、前回分を `.bak` に保持し、壊れていたら `.bak` から読む）
 - `js/indexer.js`：フォントファイルの `name` / `OS/2` テーブルだけを読み、PostScript名→和名・英名・ウエイトを対応付け。サイズ＋更新日時で差分更新
 - `js/model.js`：ファミリー化と検索（DOM非依存）
-- `js/main.js`：仮想リスト、遅延読み込み（`local()` 優先。読めないフォントは索引にあるファイルから読み込み、上限40件でLRU破棄。それでも描けない Adobe Fonts・合成フォントは Illustrator に描かせた画像を表示し、`pv/` にキャッシュ）
+- `js/preview.js`：プレビューの遅延読み込み（`local()` 優先。読めないフォントは索引にあるファイルから読み込み、合計 160MB を超えたら古いものから破棄。それでも描けない Adobe Fonts・合成フォントは Illustrator に描かせた画像を表示し、`pv/` にキャッシュ。Illustrator での描画はパネルにフォーカスかポインタがあるときだけ）
+- `js/main.js`：仮想リスト（行の要素は変わったときだけ差し替え）、操作、Illustrator の一覧取得と走査の直列化（フォーカス時に一覧が変わっていればファイルも差分走査）
+
+設定ファイルは `~/Library/Application Support/FontQuickPicker/`（Windows は `%APPDATA%\FontQuickPicker\`）：`settings.json`（お気に入り・非表示・最近使ったフォントなど）、`seen.json`（新着用の初回観測日時）、`hostfonts.json`・`index.json`（起動を速くするキャッシュ）、`pv/`（プレビュー画像）。
+
+UXP へ移す場合に書き換えが必要なのは、CEP 依存の `cep.js`、ファイル I/O の `store.js`・`indexer.js`・`preview.js`、それと `host.jsx` です。`model.js`・`rights.js` は環境に依存しません。
 
 キャッシュ・設定：`~/Library/Application Support/FontQuickPicker/`
 

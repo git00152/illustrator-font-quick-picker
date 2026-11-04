@@ -1,9 +1,11 @@
 'use strict';
 // Font Quick Picker - panel UI
+// Modules: cep.js (CEP / Illustrator bridge), store.js (settings files), preview.js
+// (preview fonts and Illustrator-rendered images), indexer.js, model.js, rights.js.
 (function () {
-  const fsp = require('fs').promises;
   const path = require('path');
 
+  // bootstrap: the extension folder, from which the modules are loaded
   function extRoot() {
     let p = window.__adobe_cep__.getSystemPath('extension');
     p = decodeURI(p.replace(/^file:\/\//, ''));
@@ -11,10 +13,13 @@
     return p;
   }
   const ROOT = extRoot();
-  const indexer = require(path.join(ROOT, 'js', 'indexer.js'));
-  const model = require(path.join(ROOT, 'js', 'model.js'));
-  const rights = require(path.join(ROOT, 'js', 'rights.js'));
-  const DATA = indexer.dataDir();
+  const MODULES = ['cep.js', 'store.js', 'preview.js', 'indexer.js', 'model.js', 'rights.js'];
+  const mod = (m) => require(path.join(ROOT, 'js', m));
+  const cep = mod('cep.js');
+  const indexer = mod('indexer.js');
+  const model = mod('model.js');
+  const rights = mod('rights.js');
+  const store = mod('store.js').createStore(indexer.dataDir());
   // manifest.xml is the single source of the version
   const VERSION = (() => {
     try {
@@ -30,250 +35,84 @@
   const cfg = {
     previewText: DEFAULT_PV, previewSize: 28, favorites: [], recent: [], extraDirs: [],
     hidden: [], view: 'preview', clickApply: true, cls: '',
+    keyPs: {},   // stored family key -> one of its PostScript names (model.remapKeys)
   };
-  const state = { host: [], hostCount: -1, psMap: {}, comp: new Set(), families: [], filtered: [], sel: 0, mode: 'all', open: null };
-  let favSet = new Set(), hiddenSet = new Set();
+  const state = {
+    host: [], hostSig: '', psMap: {}, comp: new Set(), seen: {}, filesReady: false,
+    families: [], filtered: [], sel: 0, mode: 'all', open: null,
+  };
+  let favSet = new Set(), hiddenSet = new Set(), famByKey = new Map();
   const NEW_MAX = 50;
+  const TAB_ORDER = ['all', 'ja', 'en', 'comp', 'fav', 'recent', 'new'];   // Cmd/Ctrl+1..7
   const CLS_LABEL = { serif: 'Serif', sans: 'Sans', slab: 'Slab', script: 'Script', mono: 'Mono', display: 'Display', symbol: 'Symbol' };
 
+  // ---------- status line ----------
+  // A result (applied, failed, cache cleared, ...) stays for NOTIFY_MS before the
+  // family count or a progress message may replace it.
+  const NOTIFY_MS = 4000;
+  let holdUntil = 0, holdT = null;
+  function status(msg) { $status.textContent = msg; }
+  function notify(msg, ms) {
+    const d = ms || NOTIFY_MS;
+    status(msg);
+    holdUntil = Date.now() + d;
+    clearTimeout(holdT);
+    holdT = setTimeout(countStatus, d);
+  }
+  function progress(msg) { if (Date.now() >= holdUntil) status(msg); }
+  function countStatus() {
+    if (Date.now() < holdUntil) return;
+    status(state.filtered.length + ' / ' + state.families.length + ' ファミリー'
+      + (hiddenSet.size && state.mode !== 'hidden' ? '（非表示 ' + hiddenSet.size + '）' : ''));
+  }
+
   // ---------- persistence ----------
-  async function loadJSON(name, dflt) {
-    try { return JSON.parse(await fsp.readFile(path.join(DATA, name), 'utf8')); } catch (e) { return dflt; }
-  }
-  async function saveJSON(name, obj) {
-    try {
-      await fsp.mkdir(DATA, { recursive: true });
-      await fsp.writeFile(path.join(DATA, name), JSON.stringify(obj));
-    } catch (e) { status('保存に失敗しました: ' + e.message); }
-  }
   let saveT = null;
+  function snapshotCfg() {
+    cfg.favorites = Array.from(favSet);
+    cfg.hidden = Array.from(hiddenSet);
+    const keyPs = {};
+    for (const k of new Set(cfg.favorites.concat(cfg.hidden, cfg.recent))) {
+      const f = famByKey.get(k);
+      const ps = f ? f.styles[0].ps : (cfg.keyPs || {})[k];
+      if (ps) keyPs[k] = ps;
+    }
+    cfg.keyPs = keyPs;
+    return cfg;
+  }
   function saveCfg() {
     clearTimeout(saveT);
     saveT = setTimeout(() => {
-      cfg.favorites = Array.from(favSet);
-      cfg.hidden = Array.from(hiddenSet);
-      saveJSON('settings.json', cfg);
+      saveT = null;
+      store.save('settings.json', snapshotCfg()).catch((e) => notify('設定の保存に失敗しました: ' + e.message));
     }, 300);
   }
+  // pending debounced save, written synchronously (panel closing or reloading)
+  function flushCfg() {
+    if (!saveT) return;
+    clearTimeout(saveT);
+    saveT = null;
+    try { store.saveSync('settings.json', snapshotCfg()); } catch (e) { /* nothing to report to */ }
+  }
+  window.addEventListener('beforeunload', flushCfg);
 
-  // ---------- host bridge ----------
-  function evalJsx(code) {
-    return new Promise((res) => window.__adobe_cep__.evalScript(code, (r) => res(r)));
-  }
-  function status(msg) { $status.textContent = msg; }
-
-  // ---------- font loading ----------
-  const aliasIds = new Map();
-  function aliasOf(st) {
-    let id = aliasIds.get(st.ps);
-    if (!id) { id = 'fqp' + (aliasIds.size + 1); aliasIds.set(st.ps, id); }
-    return id;
-  }
-  const loaded = new Map();      // alias -> { ok, failed, face, buf, last }
-  const pending = new Set();
-  const queue = [];
-  let active = 0, bufCount = 0, visible = new Set(), loadT = null;
-  const BUF_MAX = 40, CONCURRENCY = 4;
-
-  // styles: every style whose preview is on screen
-  function scheduleLoads(styles) {
-    clearTimeout(loadT);
-    loadT = setTimeout(() => {
-      visible = new Set();
-      for (const st of styles) {
-        const a = aliasOf(st);
-        visible.add(a);
-        const L = loaded.get(a);
-        if (L) { L.last = Date.now(); continue; }
-        if (!pending.has(a)) { pending.add(a); queue.push(st); }
-      }
-      pump();
-    }, 50);
-  }
-  function pump() {
-    while (active < CONCURRENCY && queue.length) {
-      const st = queue.shift(), a = aliasOf(st);
-      if (!visible.has(a)) { pending.delete(a); continue; }
-      active++;
-      loadFace(st).finally(() => { active--; pending.delete(a); render(); pump(); });
-    }
-  }
-  async function loadFace(st) {
-    const a = aliasOf(st);
-    let face = null, buf = false;
-    // descriptors match the style, so the browser never synthesizes bold/italic
-    const desc = { weight: String(st.weight || 400), style: st.italic ? 'italic' : 'normal' };
-    if (st.local) {
-      // older Chromium (CEP) does not always match the PostScript name, so the full
-      // name is tried as well
-      const src = Array.from(new Set([st.ps, st.full, st.ps.replace(/-/g, ' ')].filter(Boolean)))
-        .map((n) => 'local("' + cssStr(n) + '")').join(', ');
-      try { face = new FontFace(a, src, desc); await face.load(); } catch (e) { face = null; }
-    }
-    // only files the indexer found are read; Adobe Fonts files never are (see indexer)
-    if (!face && st.file && st.index === 0 && !indexer.isAdobeFontsPath(st.file)) {
-      try {
-        const d = await fsp.readFile(st.file);
-        face = new FontFace(a, d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength), desc);
-        await face.load();
-        buf = true;
-      } catch (e) { face = null; }
-    }
-    if (!face) {
-      // last resort: the family as installed in the OS (CSS font-family plus weight/style)
-      const sys = (st.fams || []).some(familyAvailable);
-      loaded.set(a, sys ? { ok: true, sys: true, last: Date.now() } : { failed: true, last: Date.now() });
-      return;
-    }
-    document.fonts.add(face);
-    loaded.set(a, { ok: true, face, buf, last: Date.now() });
-    if (buf) { bufCount++; evict(); }
-  }
-  // font names go inside CSS strings inside HTML attributes: drop quotes and backslashes
-  // ---------- Illustrator-rendered previews ----------
-  // Fonts the panel cannot draw (Adobe Fonts usable only in Adobe apps, composite
-  // fonts) are set by Illustrator itself and captured as PNG (host.jsx fqp_render).
-  // Images are cached per font and preview text.
-  const crypto = require('crypto');
-  const PV_DIR = path.join(DATA, 'pv');
-  const AI_BATCH = 8;
-  // rendered at the preview size and the screen's pixel density, then shown 1:1
-  // text color of the panel theme (CSS filters blur images in CEP's Chromium)
-  function aiGray() { return document.body.classList.contains('light') ? 30 : 232; }
-  function aiDpr() { return Math.max(1, Math.min(3, Math.round(window.devicePixelRatio || 1))); }
-  const aiState = new Map();   // png path -> 'ok' | 'pending' | 'fail'
-  let aiWant = [], aiT = null, aiBusy = false;
-  function aiText() { return (cfg.previewText || ' ').slice(0, 60); }
-  function aiPath(st) {
-    const key = ['r3', st.ps, aiText(), cfg.previewSize, aiDpr(), aiGray()].join('\n');
-    return path.join(PV_DIR, crypto.createHash('md5').update(key).digest('hex') + '.png');
-  }
-  function aiStatus(p) {
-    let s = aiState.get(p);
-    if (!s && require('fs').existsSync(p)) { s = 'ok'; aiState.set(p, s); }
-    return s;
-  }
-  function fileURL(p) { return 'file://' + encodeURI(p.split(path.sep).join('/')); }
-  // While the sample text or size is being edited, wait until the input has settled
-  // (and IME conversion is finished) so half-typed text is not rendered and cached.
-  const AI_SETTLE = 1500;
-  let aiEditUntil = 0, aiComposing = false;
-  function aiEdited() { aiEditUntil = Date.now() + AI_SETTLE; }
-  function scheduleAi() {
-    clearTimeout(aiT);
-    if (aiComposing) return;   // compositionend schedules again
-    aiT = setTimeout(runAi, Math.max(400, aiEditUntil - Date.now()));   // 400: scrolling
-  }
-  async function runAi() {
-    if (aiBusy) return;
-    const seen = new Set(), batch = [];
-    for (const st of aiWant) {
-      const p = aiPath(st);
-      if (seen.has(p) || aiStatus(p)) continue;
-      seen.add(p);
-      batch.push([st.ps, p]);
-      if (batch.length >= AI_BATCH) break;
-    }
-    if (!batch.length) return;
-    aiBusy = true;
-    batch.forEach(([, p]) => aiState.set(p, 'pending'));
-    status('Illustrator でプレビューを作成中…（' + batch.length + '件）');
-    try {
-      await fsp.mkdir(PV_DIR, { recursive: true });
-      await evalJsx('fqp_render(' + JSON.stringify(aiText()) + ',' + cfg.previewSize + ',' + (72 * aiDpr()) + ',' + aiGray() + ',' + JSON.stringify(batch) + ')');
-    } catch (e) { /* treated as failures below */ }
-    batch.forEach(([, p]) => {
-      let size = -1;
-      try { size = require('fs').statSync(p).size; } catch (e) {}
-      aiState.set(p, size >= 0 ? 'ok' : 'fail');
-      if (size > 0) aiBytes += size;
-    });
-    if (aiBytes > AI_CAP) pruneAiCache();
-    aiBusy = false;
-    countStatus();
-    render();   // draws the images and queues the next batch if more are visible
-  }
-  // Cache limits: images unused for 30 days are dropped, and above AI_CAP the least
-  // recently used go until the total is back under 90% of it (so it does not prune
-  // again on the next batch). aiBytes tracks the total between scans.
-  const AI_CAP = 75 * 1024 * 1024;
-  let aiBytes = 0, aiPruning = false;
-  async function pruneAiCache() {
-    if (aiPruning) return;
-    aiPruning = true;
-    try {
-      const limit = Date.now() - 30 * 864e5;
-      const files = [];
-      let total = 0;
-      for (const n of await fsp.readdir(PV_DIR)) {
-        const p = path.join(PV_DIR, n);
-        try {
-          const st = await fsp.stat(p);
-          const used = Math.max(st.atimeMs, st.mtimeMs);
-          if (used < limit) { await fsp.unlink(p); aiState.delete(p); continue; }
-          files.push({ p, used, size: st.size });
-          total += st.size;
-        } catch (e) { /* removed meanwhile */ }
-      }
-      if (total > AI_CAP) {
-        files.sort((a, b) => a.used - b.used);
-        for (const f of files) {
-          if (total <= AI_CAP * 0.9) break;
-          try { await fsp.unlink(f.p); aiState.delete(f.p); total -= f.size; } catch (e) {}
-        }
-      }
-      aiBytes = total;
-    } catch (e) { /* no cache yet */ }
-    aiPruning = false;
-  }
-  // Menu: delete every cached preview image; the visible ones are rendered again
-  async function clearAiCache() {
-    if (aiBusy || aiPruning) { status('プレビューの作成中です。少し待ってからやり直してください'); return; }
-    clearTimeout(aiT);
-    let n = 0, bytes = 0;
-    try {
-      for (const name of await fsp.readdir(PV_DIR)) {
-        if (!name.endsWith('.png')) continue;
-        const p = path.join(PV_DIR, name);
-        try { bytes += (await fsp.stat(p)).size; await fsp.unlink(p); n++; } catch (e) {}
-      }
-    } catch (e) { /* no cache yet */ }
-    aiState.clear();
-    aiBytes = 0;
-    aiEditUntil = Date.now() + 2500;   // keep the result readable before re-rendering starts
-    status('プレビュー画像のキャッシュを削除しました（' + n + '件・' + (bytes / 1048576).toFixed(1) + 'MB）');
-    render();
-  }
-
-  function cssStr(s) { return String(s).replace(/["'\\\n<>&]/g, ''); }
-  // A family is installed if text measures the same with two different fallbacks.
-  const famAvail = new Map();
-  const measureCtx = document.createElement('canvas').getContext('2d');
-  function familyAvailable(name) {
-    if (famAvail.has(name)) return famAvail.get(name);
-    const w = (fb) => { measureCtx.font = '40px "' + cssStr(name) + '", ' + fb; return measureCtx.measureText('Hamburgefonstiv あ永 0123').width; };
-    const ok = Math.abs(w('serif') - w('monospace')) < 0.5;
-    famAvail.set(name, ok);
-    return ok;
-  }
-  // CSS for a preview: the loaded face first, then the OS family with the style's weight
-  function pvFont(a, st) {
-    return 'font-family:\'' + a + '\',' + (st.fams || []).map((n) => '\'' + cssStr(n) + '\'').join(',')
-      + (st.fams && st.fams.length ? ',' : '') + 'system-ui;font-weight:' + (st.weight || 400)
-      + ';font-style:' + (st.italic ? 'italic' : 'normal');
-  }
-  function evict() {
-    if (bufCount <= BUF_MAX) return;
-    const c = Array.from(loaded.entries())
-      .filter(([a, v]) => v.buf && !visible.has(a))
-      .sort((x, y) => x[1].last - y[1].last);
-    while (bufCount > BUF_MAX && c.length) {
-      const [a, v] = c.shift();
-      document.fonts.delete(v.face);
-      loaded.delete(a);
-      bufCount--;
-    }
-  }
+  // ---------- previews ----------
+  // Illustrator renders previews only while the user is in the panel (focus or pointer),
+  // so it never opens temporary documents while they work on the artboard.
+  let panelFocused = document.hasFocus(), pointerIn = false;
+  const preview = mod('preview.js').createPreview({
+    cfg,
+    dataDir: indexer.dataDir(),
+    isAdobeFontsPath: indexer.isAdobeFontsPath,
+    renderInIllustrator: (text, size, res, gray, items) => cep.call('fqp_render', text, size, res, gray, items),
+    onChange: () => render(),
+    status: progress,
+    idle: countStatus,
+    allowed: () => panelFocused || pointerIn,
+  });
+  document.documentElement.addEventListener('mouseenter', () => { pointerIn = true; preview.resume(); });
+  document.documentElement.addEventListener('mouseleave', () => { pointerIn = false; });
+  window.addEventListener('blur', () => { panelFocused = false; });
 
   // ---------- list rendering (virtualized) ----------
   function esc(s) {
@@ -300,6 +139,11 @@
   const $tip = $('tip');
   const MARK = { ok: '○', cond: '△', ng: '×', ask: '？' };
   let tipFor = null, tipHideT = null;
+  // a link only for http(s) URLs; anything else from a font file is shown as text
+  function linkHTML(url, text) {
+    const u = cep.safeWebURL(url);
+    return u ? '<a data-url="' + esc(u) + '">' + esc(text) + '</a>' : esc(text);
+  }
   function tipHTML(f, v) {
     const r = rights.RIGHTS[v];
     let h = '<div class="tip-head"><span class="vd vd-' + v + '">' + esc(v === 'none' ? '?' : model.VENDORS[v].label) + '</span>'
@@ -322,10 +166,10 @@
     }
     if (f.mfr || f.licUrl) {
       h += '<div class="tip-meta">' + (f.mfr ? '製造元: ' + esc(f.mfr) : '')
-        + (f.licUrl ? (f.mfr ? '<br>' : '') + 'ライセンス: <a data-url="' + esc(f.licUrl) + '">' + esc(f.licUrl) + '</a>' : '') + '</div>';
+        + (f.licUrl ? (f.mfr ? '<br>' : '') + 'ライセンス: ' + linkHTML(f.licUrl, f.licUrl) : '') + '</div>';
     }
     if (r) {
-      h += '<div class="tip-src">出典: ' + r.sources.map(([t, u]) => '<a data-url="' + esc(u) + '">' + esc(t) + '</a>').join('、')
+      h += '<div class="tip-src">出典: ' + r.sources.map(([t, u]) => linkHTML(u, t)).join('、')
         + '<br>' + rights.CHECKED + ' 時点の情報です。規約は変わることがあるため、重要な案件では公式の規約を確認してください</div>';
     }
     return h;
@@ -361,7 +205,7 @@
   $tip.addEventListener('click', (e) => {
     const u = e.target.dataset && e.target.dataset.url;
     if (!u) return;
-    try { window.cep.util.openURLInDefaultBrowser(u); } catch (err) { window.open(u); }
+    if (!cep.openURL(u)) notify('このリンクは開けません');
   });
   $list.addEventListener('scroll', () => hideTip(0));
   function rowH() { return compact() ? 28 : Math.round(cfg.previewSize * 1.35) + 26; }
@@ -383,47 +227,27 @@
     $list.scrollTop = geom().top(i) - before;
   }
   function setOpen(key) { state.open = key; }
-  // Live text in the font when the panel can draw it; otherwise Illustrator's rendering
-  // (see the "Illustrator-rendered previews" section) or a placeholder until it exists.
-  function previewHTML(tag, extra, a, st, size, pv) {
-    const L = loaded.get(a);
-    if (L && L.failed) {
-      const p = aiPath(st), s = aiStatus(p);
-      if (s === 'ok') {
-        // srcset's density descriptor keeps the image at its natural size (no
-        // resampling); the smaller weight rows scale it with zoom
-        const zoom = size === cfg.previewSize ? '' : ' style="zoom:' + (size / cfg.previewSize).toFixed(3) + '"';
-        return '<' + tag + ' class="pv' + extra + '"><img class="pv-img" srcset="' + esc(fileURL(p)) + ' ' + aiDpr() + 'x"'
-          + zoom + ' alt=""></' + tag + '>';
-      }
-      if (s !== 'fail') aiWant.push(st);
-      return '<' + tag + ' class="pv ' + (s === 'fail' ? 'failed' : 'pending') + extra + '" style="font-size:' + size + 'px">'
-        + (s === 'fail' ? 'プレビューを作成できません' : pv) + '</' + tag + '>';
-    }
-    return '<' + tag + ' class="' + pvClass(a) + extra + '" style="' + pvFont(a, st) + ';font-size:' + size + 'px">' + pv + '</' + tag + '>';
-  }
-  function pvClass(a) {
-    const L = loaded.get(a);
-    return L && L.ok ? 'pv' : (L && L.failed ? 'pv failed' : 'pv pending');
-  }
   let raf = 0;
   function render() { if (!raf) raf = requestAnimationFrame(() => { raf = 0; draw(); }); }
+  // Row elements are kept per family and replaced only when their markup changes, so
+  // scrolling moves no DOM and a finished font load rebuilds only the rows it affects.
+  const rowEls = new Map();   // 'r' / 'w' + family key -> element
+  const tmpl = document.createElement('div');
   function draw() {
     const g = geom(), n = state.filtered.length, H = g.H, top = $list.scrollTop, h = $list.clientHeight;
     $spacer.style.height = g.total + 'px';
     const s = Math.max(0, g.indexAt(top) - 3), e = Math.min(n, g.indexAt(top + h) + 4);
     const pv = esc(cfg.previewText || ' ');
-    const hideIcon = state.mode === 'hidden' ? '<span class="hide" data-act="hide" title="再表示">↺</span>'
-      : '<span class="hide" data-act="hide" title="このフォントを非表示">⊘</span>';
-    const want = [];
-    aiWant = [];
-    let html = '';
+    const hideIcon = state.mode === 'hidden' ? '<span class="hide" data-act="hide" title="再表示（Alt+H）">↺</span>'
+      : '<span class="hide" data-act="hide" title="このフォントを非表示（Alt+H）">⊘</span>';
+    preview.beginFrame();
+    const items = [];
     for (let i = s; i < e; i++) {
-      const f = state.filtered[i], st = f.styles[f.cur], a = aliasOf(st), y = g.top(i);
+      const f = state.filtered[i], st = f.styles[f.cur], y = g.top(i);
       const multi = f.styles.length > 1, open = i === g.openIdx;
       const tag = state.mode === 'new' ? fmtDate(f.added) : (f.comp ? '合成' : CLS_LABEL[f.cls]);
-      html += '<div class="row' + (i === state.sel ? ' sel' : '') + (open ? ' open' : '') + '" data-i="' + i + '" style="top:' + y + 'px;height:' + H + 'px">'
-        + '<div class="meta"><span class="star' + (favSet.has(f.key) ? ' on' : '') + '" data-act="fav">★</span>'
+      items.push(['r' + f.key, '<div class="row' + (i === state.sel ? ' sel' : '') + (open ? ' open' : '') + '" data-i="' + i + '" style="top:' + y + 'px;height:' + H + 'px">'
+        + '<div class="meta"><span class="star' + (favSet.has(f.key) ? ' on' : '') + '" data-act="fav" title="お気に入り（Alt+F）">★</span>'
         // fixed columns: titles (flexible) | tag | style | hide, so tags line up across rows
         + '<span class="titles"><span class="name">' + esc(f.display) + '</span>' + vendorBadges(f)
         + (f.nameJa && f.nameEn && f.nameJa !== f.nameEn ? '<span class="sub">' + esc(f.nameEn) + '</span>' : '') + '</span>'
@@ -431,37 +255,42 @@
         + '<span class="style"><span class="st-name">' + esc(st.name) + '</span>'
         + (multi ? '<b data-act="toggle" title="ウエイト一覧">' + f.styles.length + (open ? ' ▾' : ' ▸') + '</b>' : '') + '</span>'
         + hideIcon + '</div>'
-        + (compact() ? '' : previewHTML('div', '', a, st, cfg.previewSize, pv))
-        + '</div>';
-      if (!compact()) want.push(st);
+        + (compact() ? '' : preview.html('div', '', st, cfg.previewSize, pv))
+        + '</div>']);
       if (open) {
         const SH = g.SH, by = y + H;
-        html += '<div class="weights" style="top:' + by + 'px;height:' + g.X + 'px">';
+        let wh = '<div class="weights" style="top:' + by + 'px;height:' + g.X + 'px">';
         f.styles.forEach((ws, j) => {
-          const wy = by + 2 + j * SH, wa = aliasOf(ws);
+          const wy = by + 2 + j * SH;
           if (wy + SH < top - 200 || wy > top + h + 200) return;   // off screen
-          html += '<div class="w-row' + (j === f.cur ? ' on' : '') + '" data-i="' + i + '" data-s="' + j + '" style="top:' + (2 + j * SH) + 'px;height:' + SH + 'px">'
+          wh += '<div class="w-row' + (j === f.cur ? ' on' : '') + '" data-i="' + i + '" data-s="' + j + '" style="top:' + (2 + j * SH) + 'px;height:' + SH + 'px">'
             + '<span class="w-name">' + esc(ws.name) + '</span>'
-            + (compact() ? '' : previewHTML('span', ' w-pv', wa, ws, subPvSize(), pv))
+            + (compact() ? '' : preview.html('span', ' w-pv', ws, subPvSize(), pv))
             + '</div>';
-          if (!compact()) want.push(ws);
         });
-        html += '</div>';
+        items.push(['w' + f.key, wh + '</div>']);
       }
     }
-    $rows.innerHTML = html;
-    if (want.length) scheduleLoads(want);
-    scheduleAi();
+    const keep = new Set();
+    for (const [k, html] of items) {
+      keep.add(k);
+      const old = rowEls.get(k);
+      if (old && old._fqp === html) continue;
+      tmpl.innerHTML = html;
+      const el = tmpl.firstElementChild;
+      el._fqp = html;
+      if (old) $rows.replaceChild(el, old); else $rows.appendChild(el);
+      rowEls.set(k, el);
+    }
+    for (const [k, el] of rowEls) if (!keep.has(k)) { el.remove(); rowEls.delete(k); }
+    preview.endFrame();
   }
 
   // ---------- filtering ----------
   function applyFilter(keepKey) {
     const m = state.mode;
     let src = state.families;
-    if (m === 'recent') {
-      const byKey = new Map(state.families.map((f) => [f.key, f]));
-      src = cfg.recent.map((k) => byKey.get(k)).filter(Boolean);
-    }
+    if (m === 'recent') src = cfg.recent.map((k) => famByKey.get(k)).filter(Boolean);
     if (m === 'hidden') src = src.filter((f) => hiddenSet.has(f.key));
     else src = src.filter((f) => !hiddenSet.has(f.key));
     if (m === 'ja' || m === 'en' || m === 'comp') src = src.filter((f) => model.category(f) === m);
@@ -480,14 +309,30 @@
     render();
     countStatus();
   }
-  function countStatus() {
-    status(state.filtered.length + ' / ' + state.families.length + ' ファミリー'
-      + (hiddenSet.size && state.mode !== 'hidden' ? '（非表示 ' + hiddenSet.size + '）' : ''));
-  }
   function rebuild() {
     const cur = state.filtered[state.sel];
-    state.families = model.buildFamilies(state.host, state.psMap, state.comp);
-    applyFilter(cur && cur.key);
+    state.families = model.buildFamilies(state.host, state.psMap, state.comp, state.seen);
+    famByKey = new Map(state.families.map((f) => [f.key, f]));
+    const moved = remapStoredKeys();
+    applyFilter(cur && (moved.get(cur.key) || cur.key));
+  }
+  // keeps favorites / hidden / recent attached to their fonts when family keys change
+  function remapStoredKeys() {
+    cfg.keyPs = cfg.keyPs || {};
+    const stored = new Set([...favSet, ...hiddenSet, ...cfg.recent]);
+    const map = model.remapKeys(state.families, cfg.keyPs, stored);
+    let dirty = false;
+    for (const k of stored) if (!cfg.keyPs[k] && famByKey.has(k)) dirty = true;   // first run of this version
+    if (map.size) {
+      const tr = (k) => map.get(k) || k;
+      favSet = new Set(Array.from(favSet, tr));
+      hiddenSet = new Set(Array.from(hiddenSet, tr));
+      cfg.recent = Array.from(new Set(cfg.recent.map(tr)));
+      for (const [from, to] of map) { cfg.keyPs[to] = cfg.keyPs[from]; delete cfg.keyPs[from]; }
+      dirty = true;
+    }
+    if (dirty) saveCfg();
+    return map;
   }
 
   // ---------- selection & actions ----------
@@ -575,15 +420,15 @@
     const f = state.filtered[state.sel];
     if (!f) return;
     const st = f.styles[f.cur];
-    const r = await evalJsx('fqp_apply(' + JSON.stringify(st.ps) + ')');
+    const r = await cep.call('fqp_apply', st.ps);
     if (typeof r === 'string' && r.indexOf('OK:') === 0) {
-      status(r.slice(3) + '件に適用しました：' + f.display + ' ' + st.name);
+      notify(r.slice(3) + '件に適用しました：' + f.display + ' ' + st.name);
       cfg.recent = [f.key].concat(cfg.recent.filter((k) => k !== f.key)).slice(0, 30);
       saveCfg();
     } else {
       const code = String(r).replace('ERR:', '');
       if (silent && NOT_APPLICABLE.has(code)) return;
-      status(MSG[code] || ('適用できませんでした: ' + r));
+      notify(MSG[code] || ('適用できませんでした: ' + r));
     }
   }
   function setPreviewText(t) {
@@ -594,20 +439,20 @@
     render();
   }
   async function grabSelText() {
-    const t = await evalJsx('fqp_selText()');
-    if (!t || t === 'EvalScript error.' || !t.trim()) { status('テキストを選択してください'); return; }
+    const t = await cep.call('fqp_selText');
+    if (cep.isError(t) || !t.trim()) { notify('テキストを選択してください'); return; }
     setPreviewText(t);
-    status('見本文字に取り込みました');
+    notify('見本文字に取り込みました');
   }
   function resetPreviewText() {
     setPreviewText(DEFAULT_PV);
-    status('見本文字を既定に戻しました');
+    notify('見本文字を既定に戻しました');
   }
   // seq: rowDownSeq when the caller started; a row press since then wins over this jump
   async function selectCurrent(seq) {
     if ($q.value.trim()) return;
-    const ps = await evalJsx('fqp_current()');
-    if (!ps || ps === 'EvalScript error.') return;
+    const ps = await cep.call('fqp_current');
+    if (cep.isError(ps) || !ps) return;
     if (seq !== rowDownSeq) return;
     const i = state.filtered.findIndex((f) => f.styles.some((s) => s.ps === ps));
     if (i < 0) return;
@@ -618,20 +463,49 @@
     ensureVisible();
     render();
   }
+  async function clearAiCache() {
+    const r = await preview.clearCache();
+    if (!r) { notify('プレビューの作成中です。少し待ってからやり直してください'); return; }
+    notify('プレビュー画像のキャッシュを削除しました（' + r.n + '件・' + (r.bytes / 1048576).toFixed(1) + 'MB）', 2500);
+    render();
+  }
 
   // ---------- data refresh ----------
-  const HOST_LIST_VERSION = 2;   // 2: adds qdName
+  // Reading Illustrator's font list and scanning font files never run at the same time:
+  // each job waits for the one before it.
+  let job = Promise.resolve();
+  function exclusive(fn) {
+    const p = job.then(fn);
+    job = p.catch((e) => notify('エラー: ' + e.message));
+    return p;
+  }
+  const HOST_LIST_VERSION = 3;   // 2: adds qdName, 3: sig instead of count
+  const HOST_CHUNK = 500;        // fonts per evalScript, so Illustrator is never blocked for long
+  // Re-reads Illustrator's font list if it changed (or force). Returns true if it was read.
   async function refreshHost(force) {
-    const count = parseInt(await evalJsx('fqp_count()'), 10);
-    if (!force && count === state.hostCount) return;
-    status('Illustratorのフォント一覧を取得中…');
-    const r = await evalJsx('fqp_list()');
-    let list;
-    try { list = JSON.parse(r); } catch (e) { status('フォント一覧の取得に失敗しました: ' + String(r).slice(0, 80)); return; }
+    const sig = await cep.call('fqp_sig');
+    if (cep.isError(sig)) return false;
+    if (!force && sig === state.hostSig) return false;
+    const n = parseInt(sig, 10) || 0;
+    const list = [];
+    for (let i = 0; i < n; i += HOST_CHUNK) {
+      status('Illustratorのフォント一覧を取得中… ' + Math.min(n, i + HOST_CHUNK) + ' / ' + n);
+      const r = await cep.call('fqp_list', i, HOST_CHUNK);
+      let part;
+      try { part = JSON.parse(r); } catch (e) {
+        notify('フォント一覧の取得に失敗しました: ' + String(r).slice(0, 80));
+        return false;
+      }
+      for (const row of part) list.push(row);
+    }
     state.host = list;
-    state.hostCount = count;
-    saveJSON('hostfonts.json', { count, list, v: HOST_LIST_VERSION });
+    state.hostSig = sig;
+    if (model.markSeen(state.seen, list, Date.now())) {
+      store.save('seen.json', { v: 1, ps: state.seen }).catch(() => { /* retried on the next change */ });
+    }
+    store.save('hostfonts.json', { sig, list, v: HOST_LIST_VERSION }).catch(() => { /* only a start-up cache */ });
     rebuild();
+    return true;
   }
   async function rescanFiles() {
     status('フォントファイルを走査中…');
@@ -642,24 +516,54 @@
     });
     state.psMap = indexer.toPsMap(res.files);
     state.comp = await indexer.compositeFontNames();
+    state.filesReady = true;
     rebuild();
-    status(state.families.length + ' ファミリー（ファイル ' + res.total + '、新規解析 ' + res.parsed + '、' + ((Date.now() - t) / 1000).toFixed(1) + '秒）');
+    notify(state.families.length + ' ファミリー（ファイル ' + res.total + '、新規解析 ' + res.parsed + '、' + ((Date.now() - t) / 1000).toFixed(1) + '秒）');
   }
+  // On focus: fonts installed or activated meanwhile. A changed list also re-scans the
+  // font files (incremental), so new fonts get their names, source and install date.
+  let hostQueued = null;
+  function syncHost() {
+    if (hostQueued) return hostQueued;
+    hostQueued = exclusive(async () => {
+      hostQueued = null;
+      const changed = await refreshHost(false);
+      if (changed && state.filesReady) await rescanFiles();
+    });
+    return hostQueued;
+  }
+  function rescanAll() { return exclusive(async () => { await refreshHost(true); await rescanFiles(); }); }
 
   // ---------- events ----------
+  // Keys the panel takes while it has focus (others go to Illustrator)
   function registerKeys() {
-    const mac = [126, 125, 123, 124, 36, 76, 53, 48, 116, 121];
-    const win = [38, 40, 37, 39, 13, 27, 9, 33, 34];
-    const codes = navigator.platform.indexOf('Mac') === 0 ? mac : win;
+    const mac = navigator.platform.indexOf('Mac') === 0;
+    const plain = mac ? [126, 125, 123, 124, 36, 76, 53, 48, 116, 121] : [38, 40, 37, 39, 13, 27, 9, 33, 34];
+    const letters = mac ? [3, 4] : [70, 72];                         // F, H with Alt
+    const digits = mac ? [18, 19, 20, 21, 23, 22, 26] : [49, 50, 51, 52, 53, 54, 55];   // 1-7 with Cmd/Ctrl
     const list = [];
-    codes.forEach((k) => { list.push({ keyCode: k }); list.push({ keyCode: k, altKey: true }); });
-    try { window.__adobe_cep__.registerKeyEventsInterest(JSON.stringify(list)); } catch (e) { /* older CEP */ }
+    plain.forEach((k) => { list.push({ keyCode: k }); list.push({ keyCode: k, altKey: true }); });
+    letters.forEach((k) => list.push({ keyCode: k, altKey: true }));
+    digits.forEach((k) => list.push(mac ? { keyCode: k, metaKey: true } : { keyCode: k, ctrlKey: true }));
+    cep.registerKeyEventsInterest(list);
   }
 
   document.addEventListener('keydown', (e) => {
     if (e.isComposing || e.keyCode === 229) return;
+    // tabs: Cmd/Ctrl+1..7, anywhere in the panel
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && /^Digit[1-7]$/.test(e.code)) {
+      setMode(TAB_ORDER[+e.code.slice(5) - 1]);
+      e.preventDefault();
+      return;
+    }
     if (e.target.closest && e.target.closest('#settings, #scan')) return;
     const inQ = e.target === $q;
+    // Alt+F / Alt+H work in the search box too (e.code: Alt changes e.key on macOS)
+    if (e.altKey && !e.metaKey && !e.ctrlKey && (e.code === 'KeyF' || e.code === 'KeyH')) {
+      if (e.code === 'KeyF') toggleFav(state.sel); else toggleHidden(state.sel);
+      e.preventDefault();
+      return;
+    }
     switch (e.key) {
       case 'ArrowDown': move(1); e.preventDefault(); return;
       case 'ArrowUp': move(-1); e.preventDefault(); return;
@@ -673,7 +577,7 @@
         e.preventDefault();
         return;
     }
-    if (!inQ && !e.metaKey && !e.ctrlKey) {
+    if (!inQ && !e.metaKey && !e.ctrlKey && !e.altKey) {
       if (e.key === 'f') { toggleFav(state.sel); e.preventDefault(); return; }
       if (e.key === 'h') { toggleHidden(state.sel); e.preventDefault(); return; }
       if (e.key.length === 1) $q.focus();
@@ -684,9 +588,9 @@
   $list.addEventListener('scroll', render);
   window.addEventListener('resize', render);
 
-  // Rows are rebuilt with innerHTML whenever a preview font finishes loading. If that
-  // happens between mousedown and mouseup, Chromium drops click/dblclick, so the
-  // double click is detected on mousedown, which is hit-tested at press time.
+  // Rows are replaced whenever a preview font finishes loading. If that happens
+  // between mousedown and mouseup, Chromium drops click/dblclick, so the double click
+  // is detected on mousedown, which is hit-tested at press time.
   const DBL_MS = 500;
   let rowDownSeq = 0, lastDown = { key: null, t: 0 };
   $rows.addEventListener('mousedown', (e) => {
@@ -747,15 +651,14 @@
   $('btn-settings').addEventListener('click', () => { $('settings').hidden = !$('settings').hidden; });
   $('btn-grab').addEventListener('click', grabSelText);
   $('btn-pv-reset').addEventListener('click', resetPreviewText);
-  $('pv-text').addEventListener('input', (e) => { aiEdited(); setPreviewText(e.target.value); });
-  $('pv-text').addEventListener('compositionstart', () => { aiComposing = true; clearTimeout(aiT); });
-  $('pv-text').addEventListener('compositionend', () => { aiComposing = false; aiEdited(); scheduleAi(); });
-  $('pv-size').addEventListener('input', (e) => { aiEdited(); cfg.previewSize = +e.target.value; saveCfg(); render(); ensureVisible(); });
+  $('pv-text').addEventListener('input', (e) => { preview.edited(); setPreviewText(e.target.value); });
+  $('pv-text').addEventListener('compositionstart', () => preview.setComposing(true));
+  $('pv-text').addEventListener('compositionend', () => preview.setComposing(false));
+  $('pv-size').addEventListener('input', (e) => { preview.edited(); cfg.previewSize = +e.target.value; saveCfg(); render(); ensureVisible(); });
   $('extra-dirs').addEventListener('change', (e) => {
     cfg.extraDirs = e.target.value.split('\n').map((s) => s.trim()).filter(Boolean);
     saveCfg();
   });
-  async function rescanAll() { await refreshHost(true); await rescanFiles(); }
   $('btn-rescan').addEventListener('click', () => {
     cfg.extraDirs = $('extra-dirs').value.split('\n').map((s) => s.trim()).filter(Boolean);
     saveCfg();
@@ -783,20 +686,16 @@
   // cached Node modules, then reloads the page. manifest.xml changes still need a restart.
   async function reloadPanel() {
     status('再読み込み中…');
-    await evalJsx('$.evalFile(' + JSON.stringify(path.join(ROOT, 'jsx', 'host.jsx')) + ')');
-    for (const m of ['indexer.js', 'model.js', 'rights.js']) {
+    await cep.evalRaw('$.evalFile(' + cep.jsxArg(path.join(ROOT, 'jsx', 'host.jsx')) + ')');
+    for (const m of MODULES) {
       try { delete require.cache[require.resolve(path.join(ROOT, 'js', m))]; } catch (e) { /* not cached */ }
     }
     clearTimeout(saveT);
-    cfg.favorites = Array.from(favSet);
-    cfg.hidden = Array.from(hiddenSet);
-    await saveJSON('settings.json', cfg);   // flush a pending debounced save
+    saveT = null;
+    try { await store.save('settings.json', snapshotCfg()); } catch (e) { /* reload anyway */ }
     location.reload();
   }
-  function onFlyout(ev) {
-    let d = ev && ev.data;
-    if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { d = { menuId: (/menuId["\s:=>]+"?(\w+)/.exec(d) || [])[1] }; } }
-    const id = d && d.menuId;
+  function onFlyout(id) {
     if (id === 'grab') grabSelText();
     else if (id === 'pvreset') resetPreviewText();
     else if (id === 'view') setView(compact() ? 'preview' : 'name');
@@ -806,25 +705,20 @@
     else if (id === 'pvclear') clearAiCache();
     else if (id === 'reload') reloadPanel();
   }
-  function setupFlyout() {
-    try {
-      window.__adobe_cep__.invokeSync('setPanelFlyoutMenu', FLYOUT);
-      window.__adobe_cep__.addEventListener('com.adobe.csxs.events.flyoutMenuClicked', onFlyout);
-    } catch (e) { /* flyout menus unsupported */ }
-  }
 
   window.addEventListener('focus', async () => {
+    panelFocused = true;
+    preview.resume();
     const seq = rowDownSeq;
     $q.focus();
     $q.select();
-    await refreshHost(false);   // picks up newly activated fonts
+    await syncHost();   // picks up newly installed / activated fonts
     selectCurrent(seq);
   });
 
   function applySkin() {
     try {
-      const env = JSON.parse(window.__adobe_cep__.getHostEnvironment());
-      const c = env.appSkinInfo.panelBackgroundColor.color;
+      const c = cep.panelBackground();
       document.documentElement.style.setProperty('--bg', 'rgb(' + (c.red | 0) + ',' + (c.green | 0) + ',' + (c.blue | 0) + ')');
       document.body.classList.toggle('light', c.red * 0.299 + c.green * 0.587 + c.blue * 0.114 > 128);
     } catch (e) { /* keep default dark */ }
@@ -835,12 +729,16 @@
     status('Font Quick Picker v' + VERSION + ' 起動中…');
     $status.title = 'Font Quick Picker v' + VERSION;
     applySkin();
+    // Illustrator's brightness setting changed: colors, and Illustrator-rendered
+    // previews, whose cache key includes the text color
+    cep.onThemeChange(() => { applySkin(); render(); });
     registerKeys();
-    setupFlyout();
-    pruneAiCache();
-    Object.assign(cfg, await loadJSON('settings.json', {}));
+    cep.setFlyoutMenu(FLYOUT, onFlyout);
+    preview.pruneCache();
+    Object.assign(cfg, await store.load('settings.json', {}));
     favSet = new Set(cfg.favorites || []);
     hiddenSet = new Set(cfg.hidden || []);
+    cfg.recent = cfg.recent || [];
     $('pv-text').value = cfg.previewText;
     $('btn-pv-reset').disabled = cfg.previewText === DEFAULT_PV;
     $('pv-size').value = cfg.previewSize;
@@ -851,18 +749,20 @@
     $q.focus();
 
     // 1) instant start from caches
-    const [files, hc, comp] = await Promise.all([
-      indexer.loadCachedIndex(), loadJSON('hostfonts.json', null), indexer.compositeFontNames(),
+    const [files, hc, comp, seen] = await Promise.all([
+      indexer.loadCachedIndex(), store.load('hostfonts.json', null), indexer.compositeFontNames(),
+      store.load('seen.json', null),
     ]);
     state.psMap = indexer.toPsMap(files);
     state.comp = comp;
+    state.seen = (seen && seen.ps) || {};
     // a cache from an older format is shown at once but refreshed below
     const stale = !hc || hc.v !== HOST_LIST_VERSION;
-    if (hc && hc.list) { state.host = hc.list; state.hostCount = stale ? -1 : hc.count; rebuild(); }
-    // 2) refresh Illustrator's font list only if the count changed
-    await refreshHost(false);
-    // 3) incremental file scan in the background
-    rescanFiles().catch((e) => status('走査エラー: ' + e.message));
+    if (hc && hc.list) { state.host = hc.list; state.hostSig = stale ? '' : hc.sig; rebuild(); }
+    // 2) refresh Illustrator's font list only if it changed, then 3) the incremental
+    // file scan (in that order, never at the same time)
+    syncHost();
+    exclusive(rescanFiles);
   }
   init();
 })();
